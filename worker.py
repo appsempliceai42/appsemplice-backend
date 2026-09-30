@@ -1,6 +1,8 @@
 import json
 import os
 import modal
+from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, Field
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,38 +10,77 @@ app = modal.App("appsemplice-backend")
 
 image = modal.Image.debian_slim().pip_install(
     "google-genai",
-    "fastapi[standard]"
+    "fastapi[standard]",
+    "pydantic"
 )
 
-# Memoria di sessione volatile per mantenere lo storico della chat
-SESSIONS = {}
+SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
 
-SYSTEM_PROMPT = """
-Sei l'AI Business Analyst ufficiale di "AppSemplice.ai". Il tuo compito è qualificare i lead B2B (avvocati, commercialisti, consulenti, PMI) e raccogliere i requisiti per creare la loro Web App personalizzata in 48 ore.
+# ---------------------------------------------------------
+# SCHEMI E SCHEDE AGENTI
+# ---------------------------------------------------------
 
-REGOLE DI CONVERSAZIONE:
-1. TONO: Empatico, pragmatico, estremamente professionale e chiaro. Niente gergo tecnico. Fai massimo 1 o 2 domande mirate alla volta per capire flussi, utenti e dati in ingresso/uscita.
-2. GUARDRAILS (Filtri di qualificazione):
-   - Accetta SOLO richieste per: portali clienti, gestionali, onboarding, upload documenti, dashboard.
-   - RIFIUTA progetti fuori target (e-commerce, app native, giochi).
-   - Se fuori target, imposta "is_qualified": false, "needs_more_info": false e valorizza "rejection_reason" con: "In AppSemplice ci focalizziamo esclusivamente su Web App gestionali e portali operativi per professionisti per garantire la consegna in 48 ore. La tua richiesta richiede un'infrastruttura diversa da quella che gestiamo."
-3. TRIGGER DI CHIUSURA (Lead Qualificato):
-   - Non appena hai compreso Input e Output (in 3-5 scambi), imposta "is_qualified": true e "needs_more_info": false.
-   - Genera in "lovable_prompt" un prompt dettagliato in inglese per la creazione del prototipo su Lovable.
+# Schema output Agente 1 (Qualification Analyst)
+class Agent1Output(BaseModel):
+    user_message: str = Field(description="La risposta per l'utente in Markdown amichevole e consulenziale.")
+    questions_asked_count: int = Field(description="Conteggio totale progressivo delle domande chiave fatte finora nella conversazione.")
+    is_qualified: bool = Field(description="Imposta su True SOLO SE hai posto ed ottenuto risposta ad ALMENO 4 DOMANDE chiave E hai dettagli sufficienti per lo sviluppo.")
+    needs_more_info: bool = Field(description="True se servono ancora domande di chiarimento (obbligatorio se questions_asked_count < 4, con limite massimo a 8).")
+    rejection_reason: Optional[str] = Field(default=None, description="Spiegazione se la richiesta è Out-of-Scope (es. e-commerce B2C, app native mobile, social network).")
+    business_summary: Optional[str] = Field(default=None, description="Sintesi dei requisiti di business raccolti finora (compilato quando is_qualified=True).")
 
-FORMATO DI RISPOSTA OBLIGATORIO (JSON VALIDO):
-{
-  "user_message": "Testo per l'utente in Markdown",
-  "is_qualified": false,
-  "needs_more_info": true,
-  "rejection_reason": null,
-  "lovable_prompt": null,
-  "extracted_requirements": {
-    "process": "Descrizione del processo",
-    "pain_points": ["Punto 1", "Punto 2"]
-  }
-}
+AGENTE_1_SYSTEM_PROMPT = """
+Sei l'AI Business Analyst ufficiale di AppSemplice.ai.
+Il tuo obiettivo è dialogare con clienti B2B (professionisti, PMI, consulenti), comprendere i loro problemi operativi e qualificare il lead per la realizzazione di una Web App gestionale/portale operativo in 48 ore.
+
+REGOLE RIGIDE SUL NUMERO DI DOMANDE (MINIMO 4, MASSIMO 8):
+1. **REQUISITO MINIMO (Almeno 4 Domande)**:
+   - NON PUOI MAI impostare `is_qualified: true` finché non hai fatto ed ottenuto risposta ad **ALMENO 4 DOMANDE chiave distinte**.
+   - Fai 1 o massimo 2 domande alla volta per mantenere la conversazione fluida.
+2. **REQUISITO MASSIMO (Massimo 8 Domande)**:
+   - Entro la 8ª domanda devi concludere l'analisi e decidere se qualificare (`is_qualified: true`) o rifiutare.
+3. **AREE CHIAVE DA ESPLORARE (4 Domande Fondamentali)**:
+   - Domanda 1: Processo aziendale e flusso operativo (Input ➔ Passaggi ➔ Output attesi).
+   - Domanda 2: Tipologie di utenti e permessi (es. Admin vs Staff vs Cliente finale).
+   - Domanda 3: Gestione dati e documenti (es. upload PDF/Excel, form di inserimento, export).
+   - Domanda 4: Problema principale (pain point) da risolvere e obiettivo primario.
+
+GUARDRAILS (SCOPE VALIDATION):
+- **IN-TARGET**: Portali clienti, gestionali interni, onboarding, dashboard operative, upload/gestione documenti, automazione pratiche B2B.
+- **OUT-OF-SCOPE**: E-commerce B2C con carrello/catalogo pubblico consumer, app mobili native (iOS/Android da store), social media, videogiochi.
+- **Se OUT-OF-SCOPE**: Puoi interrompere la conversazione anche prima delle 4 domande. Imposta `is_qualified: false`, `needs_more_info: false` e spiega in `rejection_reason` cosa realizziamo in 48 ore.
+
+TONO DI VOCE:
+- Consulenziale, professionale, empatico e privo di gergo tecnico complesso.
 """
+
+# Schema output Agente 2 (System Architect)
+class Agent2Output(BaseModel):
+    lovable_prompt: str = Field(description="Comprehensive technical specification prompt in English for Lovable (React, Tailwind, Supabase).")
+    extracted_requirements: Dict[str, Any] = Field(description="Structured dictionary with process, pain_points, modules, roles, and delivery_hours.")
+
+AGENTE_2_SYSTEM_PROMPT = """
+Sei il Lead System Architect di AppSemplice.ai.
+Analizza la conversazione completata dall'AI Business Analyst e genera la specifica tecnica definitiva per Lovable.
+
+REQUISITI DI OUTPUT:
+1. lovable_prompt: Un prompt dettagliato e professionale IN INGLESE strutturato per Lovable (React, Tailwind, Supabase), con:
+   - Project Vision & Core Features
+   - UI/UX Layout & Color Scheme (modern glassmorphism, clean B2B look)
+   - Role-Based Access Control (Admin vs Client vs Staff)
+   - Database schema & Data entities (Supabase tables and fields)
+   - Step-by-Step Workflow logic & Actions
+2. extracted_requirements: Un oggetto JSON con:
+   - "process": descrizione sintetica del processo
+   - "pain_points": array di problemi risolti
+   - "modules": array dei moduli della web app
+   - "roles": array dei ruoli utente (es. ["Admin", "Consultant", "Client"])
+   - "delivery_hours": 48
+"""
+
+# ---------------------------------------------------------
+# FASTAPI APP & ENDPOINT
+# ---------------------------------------------------------
 
 web_app = FastAPI()
 
@@ -55,7 +96,7 @@ web_app.add_middleware(
 async def chat_endpoint(request: Request):
     from google import genai
     from google.genai import types
-    
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return {
@@ -77,7 +118,7 @@ async def chat_endpoint(request: Request):
 
     if not user_message:
         return {
-            "message": "Errore: nessun messaggio inviato.",
+            "message": "Nessun messaggio inviato.",
             "is_qualified": False,
             "needs_more_info": True,
             "rejection_reason": None,
@@ -85,28 +126,34 @@ async def chat_endpoint(request: Request):
             "extracted_requirements": None
         }
 
-    # Recupera o crea lo storico di sessione
+    # Gestione storico di sessione
     if session_id not in SESSIONS:
         SESSIONS[session_id] = []
 
     history = SESSIONS[session_id]
     history.append({"role": "user", "parts": [{"text": user_message}]})
 
+    client = genai.Client(api_key=api_key)
+
+    # ---------------------------------------------------------
+    # STEP 1: ESECUZIONE AGENTE 1 (Qualification Analyst)
+    # ---------------------------------------------------------
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
+        res1 = client.models.generate_content(
             model="gemini-3.8-flash",
             contents=history,
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.3
+                system_instruction=AGENTE_1_SYSTEM_PROMPT,
+                temperature=0.2,
+                response_mime_type="application/json",
+                response_schema=Agent1Output,
             )
         )
-        raw_response = response.text
+        agent1_data: Agent1Output = Agent1Output.model_validate_json(res1.text)
     except Exception as e:
-        print(f"Errore Gemini API: {e}")
+        print(f"Errore Agente 1: {e}")
         return {
-            "message": "Scusami, ho avuto un attimo di esitazione. Puoi ripetere l'ultimo concetto?",
+            "message": "Scusami, ho avuto un piccolo problema di connessione. Puoi ripetere?",
             "is_qualified": False,
             "needs_more_info": True,
             "rejection_reason": None,
@@ -114,33 +161,47 @@ async def chat_endpoint(request: Request):
             "extracted_requirements": None
         }
 
-    try:
-        clean_json = raw_response.replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(clean_json)
+    # Salva nello storico la risposta dell'Agente 1
+    history.append({"role": "model", "parts": [{"text": agent1_data.user_message}]})
 
-        # Salva la risposta dell'AI nello storico
-        ai_text = parsed.get("user_message", raw_response)
-        history.append({"role": "model", "parts": [{"text": ai_text}]})
+    lovable_prompt = None
+    extracted_requirements = None
 
-        return {
-            "message": ai_text,
-            "is_qualified": parsed.get("is_qualified", False),
-            "needs_more_info": parsed.get("needs_more_info", True),
-            "rejection_reason": parsed.get("rejection_reason", None),
-            "lovable_prompt": parsed.get("lovable_prompt", None),
-            "extracted_requirements": parsed.get("extracted_requirements", None)
-        }
-    except Exception as e:
-        print(f"Errore parsing JSON: {e}")
-        history.append({"role": "model", "parts": [{"text": raw_response}]})
-        return {
-            "message": raw_response,
-            "is_qualified": False,
-            "needs_more_info": True,
-            "rejection_reason": None,
-            "lovable_prompt": None,
-            "extracted_requirements": None
-        }
+    # ---------------------------------------------------------
+    # STEP 2: ESECUZIONE AGENTE 2 (System Architect - Solo se Qualificato)
+    # ---------------------------------------------------------
+    if agent1_data.is_qualified:
+        try:
+            architect_input = (
+                f"Sintesi Business dall'Analista: {agent1_data.business_summary}\n\n"
+                f"Storico Completo Conversazione:\n{json.dumps(history, indent=2)}"
+            )
+            
+            res2 = client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=architect_input,
+                config=types.GenerateContentConfig(
+                    system_instruction=AGENTE_2_SYSTEM_PROMPT,
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                    response_schema=Agent2Output,
+                )
+            )
+            agent2_data: Agent2Output = Agent2Output.model_validate_json(res2.text)
+            lovable_prompt = agent2_data.lovable_prompt
+            extracted_requirements = agent2_data.extracted_requirements
+        except Exception as e:
+            print(f"Errore Agente 2: {e}")
+
+    # Risposta finale compatibile al 100% con il contratto di Lovable
+    return {
+        "message": agent1_data.user_message,
+        "is_qualified": agent1_data.is_qualified,
+        "needs_more_info": agent1_data.needs_more_info,
+        "rejection_reason": agent1_data.rejection_reason,
+        "lovable_prompt": lovable_prompt,
+        "extracted_requirements": extracted_requirements
+    }
 
 @app.function(image=image, secrets=[modal.Secret.from_name("my-gemini-secret")])
 @modal.asgi_app()
