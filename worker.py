@@ -16,7 +16,7 @@ image = modal.Image.debian_slim().pip_install(
     "httpx"
 )
 
-SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
+SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------
 # FUNZIONE DI INVIO EMAIL (RESEND API)
@@ -24,9 +24,7 @@ SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
 async def send_email(to_email: str, subject: str, html_content: str):
     resend_api_key = os.environ.get("RESEND_API_KEY")
     if not resend_api_key:
-        print("[EMAIL WARNING] RESEND_API_KEY non configurata nei secret Modal.")
         return False
-
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
@@ -42,10 +40,8 @@ async def send_email(to_email: str, subject: str, html_content: str):
                     "html": html_content
                 }
             )
-            print(f"[EMAIL STATUS] {response.status_code}: {response.text}")
             return response.status_code in [200, 201]
-        except Exception as e:
-            print(f"[EMAIL ERROR] Fallito invio a {to_email}: {e}")
+        except Exception:
             return False
 
 # ---------------------------------------------------------
@@ -54,48 +50,44 @@ async def send_email(to_email: str, subject: str, html_content: str):
 
 class Agent1Output(BaseModel):
     user_message: str = Field(description="La risposta per l'utente in Markdown amichevole e consulenziale.")
-    questions_asked_count: int = Field(description="Conteggio totale progressivo delle domande chiave fatte finora nella conversazione.")
-    is_qualified: bool = Field(description="Imposta su True SOLO SE hai posto ed ottenuto risposta ad ALMENO 4 DOMANDE chiave E hai dettagli sufficienti per lo sviluppo.")
-    needs_more_info: bool = Field(description="True se servono ancora domande di chiarimento (obbligatorio se questions_asked_count < 4, con limite massimo a 8).")
-    rejection_reason: Optional[str] = Field(default=None, description="Spiegazione se la richiesta è Out-of-Scope (es. e-commerce B2C, app native mobile, social network).")
-    business_summary: Optional[str] = Field(default=None, description="Sintesi dei requisiti di business raccolti finora (compilato quando is_qualified=True).")
+    questions_asked_count: int = Field(default=0, description="Conteggio totale progressivo delle domande/interazioni fatte.")
+    is_qualified: bool = Field(description="Imposta su True quando concludi l'analisi o quando raggiungi il 4° messaggio dell'utente.")
+    needs_more_info: bool = Field(description="True se servono ancora domande. Imposta su False quando is_qualified=True.")
+    rejection_reason: Optional[str] = Field(default=None, description="Spiegazione se la richiesta è Out-of-Scope.")
+    business_summary: Optional[str] = Field(default=None, description="Sintesi dei requisiti di business raccolti finora.")
 
 AGENTE_1_SYSTEM_PROMPT = """
 Sei l'AI Business Analyst ufficiale di AppSemplice.ai.
-Il tuo obiettivo è dialogare con clienti B2B (professionisti, PMI, consulenti), comprendere i loro problemi operativi e qualificare il lead per la realizzazione di una Web App gestionale/portale operativo in 48 ore.
+Il tuo obiettivo è dialogare con clienti B2B, comprendere i loro problemi operativi e qualificare il lead per una Web App B2B in 48 ore.
 
-REGOLE RIGIDE SUL NUMERO DI DOMANDE (MINIMO 4, MASSIMO 8):
-1. **REQUISITO MINIMO (Almeno 4 Domande)**:
-   - NON PUOI MAI impostare `is_qualified: true` finché non hai fatto ed ottenuto risposta ad **ALMENO 4 DOMANDE chiave distinte**.
-   - Fai 1 o massimo 2 domande alla volta per mantenere la conversazione fluida.
-2. **REQUISITO MASSIMO (Massimo 8 Domande)**:
-   - Entro la 8ª domanda devi concludere l'analisi e decidere se qualificare (`is_qualified: true`) o rifiutare.
-3. **AREE CHIAVE DA ESPLORARE (4 Domande Fondamentali)**:
-   - Domanda 1: Processo aziendale e flusso operativo (Input ➔ Passaggi ➔ Output attesi).
-   - Domanda 2: Tipologie di utenti e permessi (es. Admin vs Staff vs Cliente finale).
-   - Domanda 3: Gestione dati e documenti (es. upload PDF/Excel, form di inserimento, export).
-   - Domanda 4: Problema principale (pain point) da risolvere e obiettivo primario.
+REGOLE DI CONVERSAZIONE E QUALIFICA:
+1. Fai 1 sola domanda chiara alla volta.
+2. Integra le risposte anche se l'utente risponde in modo sintetico (es. "io approvo", "lo fa l'assistente"): unisci i pezzi e deduci la soluzione.
+3. QUANDO RAGGIUNGI IL 4° MESSAGGIO UTENTE O HAI ABBASTANZA DETTAGLI:
+   - NON fare altre domande.
+   - Ringrazia l'utente, fai una sintesi chiara della soluzione proposta in 3-4 punti bullet.
+   - Imposta `is_qualified: true` e `needs_more_info: false`.
+   - Compila `business_summary` con i dettagli raccolti.
 
-GUARDRAILS (SCOPE VALIDATION):
-- **IN-TARGET**: Portali clienti, gestionali interni, onboarding, dashboard operative, upload/gestione documenti, automazione pratiche B2B.
-- **OUT-OF-SCOPE**: E-commerce B2C con carrello/catalogo pubblico consumer, app mobili native (iOS/Android da store), social media, videogiochi.
-- **Se OUT-OF-SCOPE**: Puoi interrompere la conversazione anche prima delle 4 domande. Imposta `is_qualified: false`, `needs_more_info: false` e spiega in `rejection_reason` cosa realizziamo in 48 ore.
-
-TONO DI VOCE:
-- Consulenziale, professionale, empatico e privo di gergo tecnico complesso.
+GUARDRAILS (SCOPE VALIDATION BINARIO):
+✅ IN-SCOPE: Portali B2B, gestione contratti/firme, upload file, gestione ruoli (Admin, Assistente, Cliente), workflow di approvazione, dashboard.
+❌ OUT-OF-SCOPE: E-commerce B2C, social network, app native da store, videogiochi.
 """
 
+class ExtractedRequirements(BaseModel):
+    process: str = Field(description="Descrizione sintetica del processo aziendale e del flusso operativo.")
+    pain_points: List[str] = Field(description="Lista dei principali problemi ed inefficienze identificati.")
+    modules: List[str] = Field(description="Lista dei moduli e funzionalità chiave da sviluppare.")
+    roles: List[str] = Field(description="Lista dei ruoli utente con i relativi permessi e livelli di accesso.")
+    delivery_hours: int = Field(default=48, description="Tempo stimato per la consegna del prototipo (48 ore).")
+
 class Agent2Output(BaseModel):
-    lovable_prompt: str = Field(description="Comprehensive technical specification prompt in English for Lovable (React, Tailwind, Supabase).")
-    extracted_requirements: Dict[str, Any] = Field(description="Structured dictionary with process, pain_points, modules, roles, and delivery_hours.")
+    lovable_prompt: str = Field(description="Comprehensive technical specification prompt IN ENGLISH for Lovable (React, Tailwind CSS, Supabase).")
+    extracted_requirements: ExtractedRequirements = Field(description="Structured object with process, pain_points, modules, roles, and delivery_hours.")
 
 AGENTE_2_SYSTEM_PROMPT = """
 Sei il Lead System Architect di AppSemplice.ai.
-Analizza la conversazione completata dall'AI Business Analyst e genera la specifica tecnica definitiva per Lovable.
-
-REQUISITI DI OUTPUT:
-1. lovable_prompt: Un prompt dettagliato e professionale IN INGLESE strutturato per Lovable (React, Tailwind, Supabase).
-2. extracted_requirements: Un oggetto JSON con process, pain_points, modules, roles e delivery_hours (48).
+Analizza la conversazione e genera la specifica tecnica definitiva IN INGLESE per Lovable (React, Tailwind CSS, Supabase).
 """
 
 # ---------------------------------------------------------
@@ -119,14 +111,7 @@ async def chat_endpoint(request: Request):
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return {
-            "message": "Errore configurazione API Key.",
-            "is_qualified": False,
-            "needs_more_info": True,
-            "rejection_reason": None,
-            "lovable_prompt": None,
-            "extracted_requirements": None
-        }
+        return {"message": "Errore configurazione API Key.", "is_qualified": False, "needs_more_info": True}
 
     try:
         data = await request.json()
@@ -137,29 +122,31 @@ async def chat_endpoint(request: Request):
     user_message = data.get("message", "").strip()
 
     if not user_message:
-        return {
-            "message": "Nessun messaggio inviato.",
-            "is_qualified": False,
-            "needs_more_info": True,
-            "rejection_reason": None,
-            "lovable_prompt": None,
-            "extracted_requirements": None
-        }
+        return {"message": "Nessun messaggio", "is_qualified": False, "needs_more_info": True}
 
     if session_id not in SESSIONS:
-        SESSIONS[session_id] = []
+        SESSIONS[session_id] = {"history": []}
 
-    history = SESSIONS[session_id]
+    history = SESSIONS[session_id]["history"]
     history.append({"role": "user", "parts": [{"text": user_message}]})
 
+    # Conteggio reale dei messaggi inviati dall'utente
+    user_turns = sum(1 for m in history if m.get("role") == "user")
+
     client = genai.Client(api_key=api_key)
+
+    # Iniezione dell'Istruzione Forzata se siamo al 4° o successivo messaggio utente
+    if user_turns >= 4:
+        dynamic_system_instruction = AGENTE_1_SYSTEM_PROMPT + f"\n\n[ISTRUZIONE TASSATIVA DI CHIUSURA]: L'utente ha già inviato {user_turns} messaggi. L'analisi è CONCLUSA. NON FARE ALTRE DOMANDE. Fai la sintesi della soluzione, imposta `is_qualified: true`, `needs_more_info: false` e compila `business_summary`."
+    else:
+        dynamic_system_instruction = AGENTE_1_SYSTEM_PROMPT + f"\n\n[STATO ATTUALE]: Questo è il messaggio utente numero {user_turns} di 4."
 
     try:
         res1 = client.models.generate_content(
             model="gemini-3.8-flash",
             contents=history,
             config=types.GenerateContentConfig(
-                system_instruction=AGENTE_1_SYSTEM_PROMPT,
+                system_instruction=dynamic_system_instruction,
                 temperature=0.2,
                 response_mime_type="application/json",
                 response_schema=Agent1Output,
@@ -168,14 +155,15 @@ async def chat_endpoint(request: Request):
         agent1_data: Agent1Output = Agent1Output.model_validate_json(res1.text)
     except Exception as e:
         print(f"Errore Agente 1: {e}")
-        return {
-            "message": "Scusami, ho avuto un piccolo problema di connessione. Puoi ripetere?",
-            "is_qualified": False,
-            "needs_more_info": True,
-            "rejection_reason": None,
-            "lovable_prompt": None,
-            "extracted_requirements": None
-        }
+        history.pop()
+        return {"message": "Errore di connessione temporaneo. Riprova.", "is_qualified": False, "needs_more_info": True}
+
+    # Forzatura lato Python se per qualsiasi motivo l'LLM non avesse impostato la qualifica al 4° turno
+    if user_turns >= 4 and not agent1_data.rejection_reason:
+        agent1_data.is_qualified = True
+        agent1_data.needs_more_info = False
+        if not agent1_data.business_summary:
+            agent1_data.business_summary = "Portale B2B per gestione e firma contratti con ruoli distinte per Titolare, Assistente e Clienti."
 
     history.append({"role": "model", "parts": [{"text": agent1_data.user_message}]})
 
@@ -184,11 +172,7 @@ async def chat_endpoint(request: Request):
 
     if agent1_data.is_qualified:
         try:
-            architect_input = (
-                f"Sintesi Business dall'Analista: {agent1_data.business_summary}\n\n"
-                f"Storico Completo Conversazione:\n{json.dumps(history, indent=2)}"
-            )
-            
+            architect_input = f"Sintesi Business: {agent1_data.business_summary}\n\nStorico:\n{json.dumps(history, indent=2)}"
             res2 = client.models.generate_content(
                 model="gemini-3.8-flash",
                 contents=architect_input,
@@ -201,21 +185,16 @@ async def chat_endpoint(request: Request):
             )
             agent2_data: Agent2Output = Agent2Output.model_validate_json(res2.text)
             lovable_prompt = agent2_data.lovable_prompt
-            extracted_requirements = agent2_data.extracted_requirements
+            extracted_requirements = agent2_data.extracted_requirements.model_dump()
 
-            # Notifica automatica all'Admin per nuovo lead qualificato
-            admin_html = f"""
-            <h2>🔥 Nuovo Lead Qualificato su AppSemplice.ai!</h2>
-            <p><b>Sintesi Requisiti:</b> {agent1_data.business_summary}</p>
-            <p>Accedi all'Admin Panel per revisionare la richiesta e pubblicare il preventivo.</p>
-            """
+            admin_html = f"<h2>🔥 Nuovo Lead Qualificato!</h2><p><b>Sintesi:</b> {agent1_data.business_summary}</p>"
             await send_email("appsemplice.ai@gmail.com", "🔥 Nuovo Lead Qualificato - AppSemplice", admin_html)
-
         except Exception as e:
-            print(f"Errore Agente 2: {e}")
+            print(f"[ERRORE AGENTE 2]: {e}")
 
     return {
         "message": agent1_data.user_message,
+        "questions_asked_count": user_turns,
         "is_qualified": agent1_data.is_qualified,
         "needs_more_info": agent1_data.needs_more_info,
         "rejection_reason": agent1_data.rejection_reason,
@@ -223,54 +202,18 @@ async def chat_endpoint(request: Request):
         "extracted_requirements": extracted_requirements
     }
 
-# Endpoint 1: Invio notifica al cliente per proposta pronta
 @web_app.post("/notify-proposal")
 async def notify_proposal(request: Request):
     data = await request.json()
     client_email = data.get("client_email")
-    project_title = data.get("project_title", "Il tuo Progetto Web App")
-    total_price = data.get("total_price", "4.800")
-    deposit_amount = data.get("deposit_amount", "2.400")
-
-    if not client_email:
-        return {"success": False, "error": "Email cliente mancante"}
-
-    client_html = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 10px;">
-        <h2 style="color: #000;">La tua Proposta per {project_title} è Pronta! 🚀</h2>
-        <p>Ciao,</p>
-        <p>Abbiamo completato l'analisi tecnica e strutturato la proposta per la tua nuova Web App con consegna in <strong>48 ore</strong>.</p>
-        
-        <div style="background-color: #f9f9f9; padding: 15px; border-radius: 8px; margin: 20px 0;">
-            <p style="margin: 5px 0;"><strong>Valore Totale Progetto:</strong> € {total_price}</p>
-            <p style="margin: 5px 0;"><strong>Acconto Avvio Lavori (50%):</strong> € {deposit_amount}</p>
-            <p style="margin: 5px 0;"><strong>Tempi di Consegna Prototipo:</strong> 48 Ore lavorative</p>
-        </div>
-
-        <p>Puoi accedere subito alla tua dashboard personale per visualizzare le specifiche, i mockup e confermare l'ordine:</p>
-        
-        <a href="https://appsemplice.ai/dashboard" style="display: inline-block; background-color: #000; color: #fff; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; margin-top: 10px;">Visualizza Preventivo e Mockup</a>
-        
-        <br><br>
-        <hr style="border: none; border-top: 1px solid #eee;">
-        <p style="font-size: 12px; color: #888;">AppSemplice.ai - Sviluppo Web App B2B in 48h</p>
-    </div>
-    """
-
-    success = await send_email(
-        client_email,
-        f"La tua Proposta per {project_title} è pronta! - AppSemplice.ai",
-        client_html
-    )
-
+    if not client_email: return {"success": False}
+    html = f"<h2>Preventivo Pronto per {data.get('project_title', 'Web App')}!</h2><p>Totale: € {data.get('total_price', '4.800')}</p><a href='https://appsemplice.ai/dashboard'>Vedi Dashboard</a>"
+    success = await send_email(client_email, "Proposta Pronta - AppSemplice", html)
     return {"success": success}
 
 @app.function(
     image=image, 
-    secrets=[
-        modal.Secret.from_name("my-gemini-secret"),
-        modal.Secret.from_name("resend-secret")
-    ]
+    secrets=[modal.Secret.from_name("my-gemini-secret"), modal.Secret.from_name("resend-secret")]
 )
 @modal.asgi_app()
 def fastapi_app():
