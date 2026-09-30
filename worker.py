@@ -1,6 +1,7 @@
 import json
 import os
 import modal
+import httpx
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, Request
@@ -11,16 +12,46 @@ app = modal.App("appsemplice-backend")
 image = modal.Image.debian_slim().pip_install(
     "google-genai",
     "fastapi[standard]",
-    "pydantic"
+    "pydantic",
+    "httpx"
 )
 
 SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
 
 # ---------------------------------------------------------
+# FUNZIONE DI INVIO EMAIL (RESEND API)
+# ---------------------------------------------------------
+async def send_email(to_email: str, subject: str, html_content: str):
+    resend_api_key = os.environ.get("RESEND_API_KEY")
+    if not resend_api_key:
+        print("[EMAIL WARNING] RESEND_API_KEY non configurata nei secret Modal.")
+        return False
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {resend_api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "from": "AppSemplice.ai <onboarding@resend.dev>",
+                    "to": [to_email],
+                    "subject": subject,
+                    "html": html_content
+                }
+            )
+            print(f"[EMAIL STATUS] {response.status_code}: {response.text}")
+            return response.status_code in [200, 201]
+        except Exception as e:
+            print(f"[EMAIL ERROR] Fallito invio a {to_email}: {e}")
+            return False
+
+# ---------------------------------------------------------
 # SCHEMI E SCHEDE AGENTI
 # ---------------------------------------------------------
 
-# Schema output Agente 1 (Qualification Analyst)
 class Agent1Output(BaseModel):
     user_message: str = Field(description="La risposta per l'utente in Markdown amichevole e consulenziale.")
     questions_asked_count: int = Field(description="Conteggio totale progressivo delle domande chiave fatte finora nella conversazione.")
@@ -54,7 +85,6 @@ TONO DI VOCE:
 - Consulenziale, professionale, empatico e privo di gergo tecnico complesso.
 """
 
-# Schema output Agente 2 (System Architect)
 class Agent2Output(BaseModel):
     lovable_prompt: str = Field(description="Comprehensive technical specification prompt in English for Lovable (React, Tailwind, Supabase).")
     extracted_requirements: Dict[str, Any] = Field(description="Structured dictionary with process, pain_points, modules, roles, and delivery_hours.")
@@ -64,22 +94,12 @@ Sei il Lead System Architect di AppSemplice.ai.
 Analizza la conversazione completata dall'AI Business Analyst e genera la specifica tecnica definitiva per Lovable.
 
 REQUISITI DI OUTPUT:
-1. lovable_prompt: Un prompt dettagliato e professionale IN INGLESE strutturato per Lovable (React, Tailwind, Supabase), con:
-   - Project Vision & Core Features
-   - UI/UX Layout & Color Scheme (modern glassmorphism, clean B2B look)
-   - Role-Based Access Control (Admin vs Client vs Staff)
-   - Database schema & Data entities (Supabase tables and fields)
-   - Step-by-Step Workflow logic & Actions
-2. extracted_requirements: Un oggetto JSON con:
-   - "process": descrizione sintetica del processo
-   - "pain_points": array di problemi risolti
-   - "modules": array dei moduli della web app
-   - "roles": array dei ruoli utente (es. ["Admin", "Consultant", "Client"])
-   - "delivery_hours": 48
+1. lovable_prompt: Un prompt dettagliato e professionale IN INGLESE strutturato per Lovable (React, Tailwind, Supabase).
+2. extracted_requirements: Un oggetto JSON con process, pain_points, modules, roles e delivery_hours (48).
 """
 
 # ---------------------------------------------------------
-# FASTAPI APP & ENDPOINT
+# FASTAPI APP & ENDPOINTS
 # ---------------------------------------------------------
 
 web_app = FastAPI()
@@ -126,7 +146,6 @@ async def chat_endpoint(request: Request):
             "extracted_requirements": None
         }
 
-    # Gestione storico di sessione
     if session_id not in SESSIONS:
         SESSIONS[session_id] = []
 
@@ -135,9 +154,6 @@ async def chat_endpoint(request: Request):
 
     client = genai.Client(api_key=api_key)
 
-    # ---------------------------------------------------------
-    # STEP 1: ESECUZIONE AGENTE 1 (Qualification Analyst)
-    # ---------------------------------------------------------
     try:
         res1 = client.models.generate_content(
             model="gemini-3.8-flash",
@@ -161,15 +177,11 @@ async def chat_endpoint(request: Request):
             "extracted_requirements": None
         }
 
-    # Salva nello storico la risposta dell'Agente 1
     history.append({"role": "model", "parts": [{"text": agent1_data.user_message}]})
 
     lovable_prompt = None
     extracted_requirements = None
 
-    # ---------------------------------------------------------
-    # STEP 2: ESECUZIONE AGENTE 2 (System Architect - Solo se Qualificato)
-    # ---------------------------------------------------------
     if agent1_data.is_qualified:
         try:
             architect_input = (
@@ -190,10 +202,18 @@ async def chat_endpoint(request: Request):
             agent2_data: Agent2Output = Agent2Output.model_validate_json(res2.text)
             lovable_prompt = agent2_data.lovable_prompt
             extracted_requirements = agent2_data.extracted_requirements
+
+            # Notifica automatica all'Admin per nuovo lead qualificato
+            admin_html = f"""
+            <h2>🔥 Nuovo Lead Qualificato su AppSemplice.ai!</h2>
+            <p><b>Sintesi Requisiti:</b> {agent1_data.business_summary}</p>
+            <p>Accedi all'Admin Panel per revisionare la richiesta e pubblicare il preventivo.</p>
+            """
+            await send_email("appsemplice.ai@gmail.com", "🔥 Nuovo Lead Qualificato - AppSemplice", admin_html)
+
         except Exception as e:
             print(f"Errore Agente 2: {e}")
 
-    # Risposta finale compatibile al 100% con il contratto di Lovable
     return {
         "message": agent1_data.user_message,
         "is_qualified": agent1_data.is_qualified,
@@ -203,7 +223,55 @@ async def chat_endpoint(request: Request):
         "extracted_requirements": extracted_requirements
     }
 
-@app.function(image=image, secrets=[modal.Secret.from_name("my-gemini-secret")])
+# Endpoint 1: Invio notifica al cliente per proposta pronta
+@web_app.post("/notify-proposal")
+async def notify_proposal(request: Request):
+    data = await request.json()
+    client_email = data.get("client_email")
+    project_title = data.get("project_title", "Il tuo Progetto Web App")
+    total_price = data.get("total_price", "4.800")
+    deposit_amount = data.get("deposit_amount", "2.400")
+
+    if not client_email:
+        return {"success": False, "error": "Email cliente mancante"}
+
+    client_html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 10px;">
+        <h2 style="color: #000;">La tua Proposta per {project_title} è Pronta! 🚀</h2>
+        <p>Ciao,</p>
+        <p>Abbiamo completato l'analisi tecnica e strutturato la proposta per la tua nuova Web App con consegna in <strong>48 ore</strong>.</p>
+        
+        <div style="background-color: #f9f9f9; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <p style="margin: 5px 0;"><strong>Valore Totale Progetto:</strong> € {total_price}</p>
+            <p style="margin: 5px 0;"><strong>Acconto Avvio Lavori (50%):</strong> € {deposit_amount}</p>
+            <p style="margin: 5px 0;"><strong>Tempi di Consegna Prototipo:</strong> 48 Ore lavorative</p>
+        </div>
+
+        <p>Puoi accedere subito alla tua dashboard personale per visualizzare le specifiche, i mockup e confermare l'ordine:</p>
+        
+        <a href="https://appsemplice.ai/dashboard" style="display: inline-block; background-color: #000; color: #fff; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; margin-top: 10px;">Visualizza Preventivo e Mockup</a>
+        
+        <br><br>
+        <hr style="border: none; border-top: 1px solid #eee;">
+        <p style="font-size: 12px; color: #888;">AppSemplice.ai - Sviluppo Web App B2B in 48h</p>
+    </div>
+    """
+
+    success = await send_email(
+        client_email,
+        f"La tua Proposta per {project_title} è pronta! - AppSemplice.ai",
+        client_html
+    )
+
+    return {"success": success}
+
+@app.function(
+    image=image, 
+    secrets=[
+        modal.Secret.from_name("my-gemini-secret"),
+        modal.Secret.from_name("resend-secret")
+    ]
+)
 @modal.asgi_app()
 def fastapi_app():
     return web_app
