@@ -2,6 +2,7 @@ import json
 import os
 import modal
 import httpx
+import stripe
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, Request
@@ -13,7 +14,8 @@ image = modal.Image.debian_slim().pip_install(
     "google-genai",
     "fastapi[standard]",
     "pydantic",
-    "httpx"
+    "httpx",
+    "stripe"
 )
 
 SESSIONS: Dict[str, Dict[str, Any]] = {}
@@ -83,7 +85,6 @@ REGOLE DI CONVERSAZIONE E QUALIFICA:
 GUARDRAILS (SCOPE VALIDATION):
 ✅ IN-SCOPE: Web app B2B, portali riservati, automazioni documentali/PEC/OCR, workflow a stati, dashboard gestionali.
 ❌ OUT-OF-SCOPE: E-commerce B2C con carrello consumer pubblico, social network, app mobili native da app store (iOS/Android), videogiochi.
-Se Out-of-Scope: Spiega garbatamente che realizziamo solo software gestionali B2B in 48h. Imposta `is_qualified: false`, `needs_more_info: false`, compila `rejection_reason`.
 
 TONO DI VOCE:
 Consulenziale, empatico, autorevole, orientato all'efficienza operativa e rigorosamente professionale.
@@ -103,15 +104,13 @@ class Agent2Output(BaseModel):
 AGENTE_2_SYSTEM_PROMPT = """
 Sei il Lead System Architect di AppSemplice.ai.
 Analizza la conversazione e la sintesi fornita dall'Analista e genera la specifica tecnica definitiva IN INGLESE per Lovable (React, Tailwind CSS, Supabase).
-
-LOVABLE PROMPT STRUCTURE REQUIREMENTS:
-1. Title and High-Level Architecture Overview (Modern Glassmorphic Dark UI, Midnight Slate/Navy).
-2. Key User Roles & Access Permissions (e.g. Admin/Titolare vs Assistant vs End Client).
-3. Core Dashboard Features, Layouts, and Data Tables.
-4. Detailed Supabase Database Schema (PostgreSQL tables, field types, foreign keys).
-5. Row Level Security (RLS) policies and security constraints.
-6. Automated Workflows (e.g., status changes, email notifications, document processing).
 """
+
+class CheckoutRequest(BaseModel):
+    project_title: str
+    amount_eur: float = Field(default=2400.0, description="Importo acconto in EUR")
+    client_email: str
+    project_id: Optional[str] = "default_project"
 
 # ---------------------------------------------------------
 # FASTAPI APP & ENDPOINTS
@@ -230,9 +229,82 @@ async def notify_proposal(request: Request):
     success = await send_email(client_email, "Proposta Pronta - AppSemplice", html)
     return {"success": success}
 
+# ---------------------------------------------------------
+# STRIPE PAYMENTS & CHECKOUT ENDPOINTS
+# ---------------------------------------------------------
+
+@web_app.post("/create-checkout-session")
+async def create_checkout_session(req: CheckoutRequest):
+    stripe_key = os.environ.get("STRIPE_SECRET_KEY")
+    if not stripe_key:
+        return {"error": "Stripe secret key non trovata nei secret di Modal"}
+
+    stripe.api_key = stripe_key
+    amount_cents = int(req.amount_eur * 100)
+
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "eur",
+                    "product_data": {
+                        "name": f"Acconto 50% - {req.project_title}",
+                        "description": "Sviluppo e consegna Web App B2B in 48 ore su AppSemplice.ai",
+                    },
+                    "unit_amount": amount_cents,
+                },
+                "quantity": 1,
+            }],
+            mode="payment",
+            customer_email=req.client_email,
+            success_url="https://appsemplice.ai/dashboard?payment=success&project_id=" + (req.project_id or "default"),
+            cancel_url="https://appsemplice.ai/dashboard?payment=cancelled",
+            metadata={
+                "project_id": req.project_id or "default",
+                "project_title": req.project_title,
+                "client_email": req.client_email
+            }
+        )
+        return {"checkout_url": session.url, "session_id": session.id}
+    except Exception as e:
+        print(f"[STRIPE ERROR]: {e}")
+        return {"error": str(e)}
+
+@web_app.post("/stripe-webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    stripe_key = os.environ.get("STRIPE_SECRET_KEY")
+    stripe.api_key = stripe_key
+
+    try:
+        event = json.loads(payload)
+        if event.get("type") == "checkout.session.completed":
+            session = event["data"]["object"]
+            client_email = session.get("customer_email") or session.get("metadata", {}).get("client_email")
+            project_title = session.get("metadata", {}).get("project_title", "Web App B2B")
+
+            # Email Admin
+            admin_html = f"<h2>💰 Acconto Ricevuto su Stripe!</h2><p><b>Progetto:</b> {project_title}</p><p><b>Cliente:</b> {client_email}</p><p>Stato: Deposit Paid. Avviare lo sviluppo in 48h!</p>"
+            await send_email("appsemplice.ai@gmail.com", f"💰 Acconto Ricevuto (€ 2.400) - {project_title}", admin_html)
+
+            # Email Cliente
+            if client_email:
+                client_html = f"<h2>Pagamento Confermato - AppSemplice.ai</h2><p>Abbiamo ricevuto l'acconto per il progetto <b>{project_title}</b>.</p><p>Il nostro team ha avviato lo sviluppo. Riceverai il prototipo entro 48 ore!</p>"
+                await send_email(client_email, "Pagamento Confermato - Avvio Lavori AppSemplice", client_html)
+
+        return {"status": "success"}
+    except Exception as e:
+        print(f"[WEBHOOK ERROR]: {e}")
+        return {"status": "error", "message": str(e)}
+
 @app.function(
     image=image, 
-    secrets=[modal.Secret.from_name("my-gemini-secret"), modal.Secret.from_name("resend-secret")]
+    secrets=[
+        modal.Secret.from_name("my-gemini-secret"), 
+        modal.Secret.from_name("resend-secret"),
+        modal.Secret.from_name("stripe-secret")
+    ]
 )
 @modal.asgi_app()
 def fastapi_app():
