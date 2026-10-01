@@ -2,7 +2,6 @@ import json
 import os
 import modal
 import httpx
-import stripe
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, Request
@@ -235,6 +234,7 @@ async def notify_proposal(request: Request):
 
 @web_app.post("/create-checkout-session")
 async def create_checkout_session(req: CheckoutRequest):
+    import stripe
     stripe_key = os.environ.get("STRIPE_SECRET_KEY")
     if not stripe_key:
         return {"error": "Stripe secret key non trovata nei secret di Modal"}
@@ -273,6 +273,7 @@ async def create_checkout_session(req: CheckoutRequest):
 
 @web_app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
+    import stripe
     payload = await request.body()
     stripe_key = os.environ.get("STRIPE_SECRET_KEY")
     stripe.api_key = stripe_key
